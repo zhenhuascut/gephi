@@ -51,7 +51,6 @@ import org.openide.util.Exceptions;
 import org.openide.util.NbBundle;
 
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -64,6 +63,7 @@ public class FruchtermanReingold extends AbstractLayout implements Layout {
     private static final float SPEED_DIVISOR = 800;
     private static final float AREA_MULTIPLICATOR = 10000;
     private static final String MODULARITY_CLASS = "modularity_class";
+    private static final String NORMALIZED_WEIGHT = "normalized_weight";
     private static final int THREAD_COUNT = Runtime.getRuntime().availableProcessors() - 1;
 
     //Graph
@@ -76,13 +76,16 @@ public class FruchtermanReingold extends AbstractLayout implements Layout {
     private boolean useCommunityDetection;
     private boolean approximate;
     private boolean communityAttraction;
+    private String communityColumnName = MODULARITY_CLASS;
 
     //Temporary Storage
     private ExecutorService pool;
-    private Map<Integer, Community> communityMap;
-    private Map<Node, Map<Community, Integer>> nodeNeighborCommunity;
+    private Map<Object, Community> communityMap;
+    private Map<Node, Map<Community, Float>> nodeNeighborCommunity;
     private Node[] nodes;
     private Edge[] edges;
+    private float maxDisplace;
+    private float k;
 
     public FruchtermanReingold(LayoutBuilder layoutBuilder) {
         super(layoutBuilder);
@@ -107,240 +110,294 @@ public class FruchtermanReingold extends AbstractLayout implements Layout {
         try {
             nodes = graph.getNodes().toArray();
             edges = graph.getEdges().toArray();
-            if (useCommunityDetection && approximate) {
-                this.communityMap = initCommunity(nodes);
-                this.nodeNeighborCommunity = initNodeNeighborCommunity(edges, communityMap);
-            }
+            normalizeEdgeWeight(edges);
+            communityMap = Collections.emptyMap();
+            nodeNeighborCommunity = Collections.emptyMap();
         } finally {
             graph.readUnlock();
         }
-
     }
 
     @Override
     public void goAlgo() {
         graph.readLock();
         try {
+            maxDisplace = (float) (Math.sqrt(AREA_MULTIPLICATOR * area) / 10f);
+            k = (float) Math.sqrt((AREA_MULTIPLICATOR * area) / (1f + nodes.length));
+
+            boolean shouldUseMap = (useCommunityDetection && approximate) || communityAttraction;
+            boolean shouldCalculateMap = shouldUseMap && (communityMap.isEmpty() || nodeNeighborCommunity.isEmpty());
+            if (shouldCalculateMap) {
+                this.communityMap = CommunityHelper.calculateCommunity(nodes, communityColumnName);
+                this.nodeNeighborCommunity = CommunityHelper.calculateNodeNeighborMap(edges, communityColumnName, communityMap);
+            }
+
             // Update Community Centroid
-            if (useCommunityDetection && approximate) {
-                updateCentroid(communityMap);
+            if (shouldUseMap) {
+                CommunityHelper.updateCentroid(communityMap, pool, AREA_MULTIPLICATOR * area, nodes.length);
             }
 
-            final float maxDisplace = (float) (Math.sqrt(AREA_MULTIPLICATOR * area) / 10f);                    // Déplacement limite : on peut le calibrer...
-            final float k = (float) Math.sqrt((AREA_MULTIPLICATOR * area) / (1f + nodes.length));        // La variable k, l'idée principale du layout.
+            initLayoutDataWithRepulsionDisplacement();
 
-            // Repulsive force
-            HashSet<Future<?>> threads = new HashSet<>(nodes.length);
             if (useCommunityDetection && approximate) {
-                for (final Node n : nodes) {
-                    threads.add(pool.submit(new Runnable() {
-                        @Override
-                        public void run() {
-                            ForceVectorNodeLayoutData layoutData = new ForceVectorNodeLayoutData();
-
-                            int communityId = (Integer) n.getAttribute(MODULARITY_CLASS);
-                            Community nodeCommunity = communityMap.get(communityId);
-
-                            // Repulsive force by other community
-                            for (Community neighbor : communityMap.values()) {
-                                if (nodeCommunity != neighbor) {
-                                    updateRepulsiveDisplacement(k, neighbor.nodes.size(), n.x() - neighbor.x, n.y() - neighbor.y, layoutData);
-                                }
-                            }
-
-                            // Repulsive force by nodes inside same community
-                            for (Node node : nodeCommunity.nodes) {
-                                if (node != n) {
-                                    updateRepulsiveDisplacement(k, 1, n.x() - node.x(), n.y() - node.y(), layoutData);
-                                }
-                            }
-                            n.setLayoutData(layoutData);
-                        }
-                    }));
-                }
+                attractionDisplacementApproximate();
             } else {
-                for (final Node n : nodes) {
-                    threads.add(pool.submit(new Runnable() {
-                        @Override
-                        public void run() {
-                            ForceVectorNodeLayoutData layoutData = new ForceVectorNodeLayoutData();
-                            for (Node N2 : nodes) {    // On fait toutes les paires de noeuds
-                                if (n != N2) {
-                                    updateRepulsiveDisplacement(k, 1, n.x() - N2.x(), n.y() - N2.y(), layoutData);
-                                }
-                            }
-                            n.setLayoutData(layoutData);
-                        }
-                    }));
-                }
+                attractionDisplacementNoApproximate();
             }
 
-            for (Future<?> thread : threads) {
-                try {
-                    thread.get();
-                } catch (Exception e) {
-                    throw new RuntimeException("Unable to calculate repulsive force", e);
-                }
+            if (communityAttraction) {
+                communityAttractionDisplacement();
             }
 
-            // Attractive force
-            if (useCommunityDetection && approximate) {
-                // Use community to simplify calculation.
-                threads = new HashSet<>(nodeNeighborCommunity.size());
-                for (final Map.Entry<Node, Map<Community, Integer>> entry : nodeNeighborCommunity.entrySet()) {
-                    threads.add(pool.submit(new Runnable() {
-                        @Override
-                        public void run() {
-                            Node n = entry.getKey();
-                            Map<Community, Integer> neighbors = entry.getValue();
-                            Community community = communityMap.get((Integer) n.getAttribute(MODULARITY_CLASS));
-                            ForceVectorNodeLayoutData layoutData = n.getLayoutData();
-                            // Attractive force by other communities.
-                            for (Map.Entry<Community, Integer> entry : neighbors.entrySet()) {
-                                // number of edges connected to the community
-                                int weight = entry.getValue();
-                                Community neighbor = entry.getKey();
-                                if (community == neighbor) {
-                                    continue;
-                                }
+            gravityAndSpeedAndSet();
 
-                                float xDist = n.x() - neighbor.x;
-                                float yDist = n.y() - neighbor.y;
-                                float dist = (float) Math.sqrt(xDist * xDist + yDist * yDist);
-                                float attractiveF = weight * alpha * dist * dist / k;
+        } finally {
+            graph.readUnlockAll();
+        }
+    }
 
-                                if (dist > 0) {
-                                    layoutData.dx -= xDist / dist * attractiveF;
-                                    layoutData.dy -= yDist / dist * attractiveF;
-                                }
-                            }
+    private void gravityAndSpeedAndSet() {
+        HashSet<Future<?>> threads = new HashSet<>(nodes.length);
+        for (final Node n : nodes) {
+            threads.add(pool.submit(new Runnable() {
+                @Override
+                public void run() {
+                    ForceVectorNodeLayoutData layoutData = n.getLayoutData();
 
-                            if (communityAttraction) {
-                                // Centroid of community drag nodes together.
-                                float xDist = n.x() - community.x;
-                                float yDist = n.y() - community.y;
-                                float dist = (float) Math.sqrt(xDist * xDist + yDist * yDist);
-                                if (dist > community.radius) {
-                                    // Only those outside the circle of radius community.radius is dragged by this force.
-                                    float weight = community.nodes.size() * (dist / community.radius - 1);
-                                    float attractiveF = weight * dist * dist / k;
-                                    if (dist > 0) {
-                                        float dx = xDist / dist * attractiveF;
-                                        float dy = yDist / dist * attractiveF;
-                                        layoutData.dx -= dx;
-                                        layoutData.dy -= dy;
-                                    }
-                                }
-                            }
-                        }
-                    }));
-                }
-                for (Future<?> thread : threads) {
-                    try {
-                        thread.get();
-                    } catch (Exception e) {
-                        throw new RuntimeException("Unable to calculate attractive force", e);
+                    // gravity
+                    float d = (float) Math.sqrt(n.x() * n.x() + n.y() * n.y());
+                    float gf = 0.01f * k * (float) gravity * d;
+                    layoutData.dx -= gf * n.x() / d;
+                    layoutData.dy -= gf * n.y() / d;
+
+                    // speed
+                    layoutData.dx *= speed / SPEED_DIVISOR;
+                    layoutData.dy *= speed / SPEED_DIVISOR;
+
+                    // Maintenant on applique le déplacement calculé sur les noeuds.
+                    // nb : le déplacement à chaque passe "instantanné" correspond à la force : c'est une sorte d'accélération.
+                    float xDist = layoutData.dx;
+                    float yDist = layoutData.dy;
+                    float dist = (float) Math.sqrt(layoutData.dx * layoutData.dx + layoutData.dy * layoutData.dy);
+                    if (dist > 0 && !n.isFixed()) {
+                        float limitedDist = Math.min(maxDisplace * ((float) speed / SPEED_DIVISOR), dist);
+                        n.setX(n.x() + xDist / dist * limitedDist);
+                        n.setY(n.y() + yDist / dist * limitedDist);
                     }
                 }
 
-                // Attractive force between nodes in same community
-                threads = new HashSet<>(edges.length);
-                Collection<Community> communities = communityMap.values();
-                for (Community community : communities) {
-                    for (final Edge edge : community.edges) {
-                        threads.add(pool.submit(new Runnable() {
-                            @Override
-                            public void run() {
-                                Node source = edge.getSource();
-                                Node target = edge.getTarget();
-                                updateAttractiveDisplacement(k, 1.0f, source, target);
-                            }
-                        }));
-                    }
-                }
+            }));
+        }
 
-                for (Future<?> thread : threads) {
-                    try {
-                        thread.get();
-                    } catch (Exception e) {
-                        throw new RuntimeException("Unable to calculate attractive force", e);
-                    }
-                }
-
-            } else {
-                threads = new HashSet<>(edges.length);
-                for (final Edge E : edges) {
-                    threads.add(pool.submit(new Runnable() {
-                        @Override
-                        public void run() {
-                            // Idem, pour tous les noeuds on applique la force d'attraction
-                            Node Nf = E.getSource();
-                            Node Nt = E.getTarget();
-
-                            // Weight is 1 if same community/label, alpha if different community/label.
-                            float weight = Nf.getLabel().equals(Nt.getLabel()) ? 1.0f : alpha;
-                            try {
-                                if (useCommunityDetection) {
-                                    weight = Nf.getAttribute(MODULARITY_CLASS).equals(Nt.getAttribute(MODULARITY_CLASS)) ? 1.0f : alpha;
-                                }
-                            } catch (IllegalArgumentException e) {
-                                // No modularity class
-                            }
-                            updateAttractiveDisplacement(k, weight, Nf, Nt);
-                        }
-                    }));
-                }
-                for (Future<?> thread : threads) {
-                    try {
-                        thread.get();
-                    } catch (Exception e) {
-                        throw new RuntimeException("Unable to calculate attractive force", e);
-                    }
-                }
+        for (Future<?> thread : threads) {
+            try {
+                thread.get();
+            } catch (Exception e) {
+                throw new RuntimeException("Unable to calculate position", e);
             }
+        }
+    }
 
-            threads = new HashSet<>(nodes.length);
+    private void attractionDisplacementNoApproximate() {
+        HashSet<Future<?>> threads = new HashSet<>(edges.length);
+        for (final Edge e : edges) {
+            threads.add(pool.submit(new Runnable() {
+                @Override
+                public void run() {
+                    // Idem, pour tous les noeuds on applique la force d'attraction
+                    Node source = e.getSource();
+                    Node target = e.getTarget();
+
+                    // Weight is 1 if same community/label, alpha if different community/label.
+                    float weight = 1.0f;
+                    try {
+                        if (useCommunityDetection) {
+                            weight = source.getAttribute(communityColumnName).equals(target.getAttribute(communityColumnName)) ? 1.0f : alpha;
+                        }
+                    } catch (IllegalArgumentException e) {
+                        // No Column named communityColumnName
+                    }
+                    weight *= (double) e.getAttribute(NORMALIZED_WEIGHT);
+                    updateAttractiveDisplacement(k, weight, source, target);
+                }
+            }));
+        }
+        for (Future<?> thread : threads) {
+            try {
+                thread.get();
+            } catch (Exception e) {
+                throw new RuntimeException("Unable to calculate attractive force", e);
+            }
+        }
+    }
+
+    private void attractionDisplacementApproximate() {
+        if (communityMap.isEmpty() || nodeNeighborCommunity.isEmpty()) {
+            return;
+        }
+        // Use community to simplify calculation.
+        HashSet<Future<?>> threads = new HashSet<>(nodeNeighborCommunity.size());
+        for (final Map.Entry<Node, Map<Community, Float>> entry : nodeNeighborCommunity.entrySet()) {
+            threads.add(pool.submit(new Runnable() {
+                @Override
+                public void run() {
+                    Node n = entry.getKey();
+                    Map<Community, Float> neighbors = entry.getValue();
+                    Community community = communityMap.get(n.getAttribute(communityColumnName));
+                    ForceVectorNodeLayoutData layoutData = n.getLayoutData();
+                    // Attractive force by other communities.
+                    for (Map.Entry<Community, Float> entry : neighbors.entrySet()) {
+                        // number of edges connected to the community
+                        float weight = entry.getValue();
+                        Community neighbor = entry.getKey();
+                        if (community == neighbor) {
+                            continue;
+                        }
+
+                        float xDist = n.x() - neighbor.x;
+                        float yDist = n.y() - neighbor.y;
+                        float dist = (float) Math.sqrt(xDist * xDist + yDist * yDist);
+                        float attractiveForce = weight * alpha * dist * dist / k;
+
+                        if (dist > 0) {
+                            layoutData.dx -= xDist / dist * attractiveForce;
+                            layoutData.dy -= yDist / dist * attractiveForce;
+                        }
+                    }
+                }
+            }));
+        }
+        for (Future<?> thread : threads) {
+            try {
+                thread.get();
+            } catch (Exception e) {
+                throw new RuntimeException("Unable to calculate attractive force", e);
+            }
+        }
+
+        // Attractive force between nodes in same community
+        threads = new HashSet<>(edges.length);
+        Collection<Community> communities = communityMap.values();
+        for (Community community : communities) {
+            for (final Edge edge : community.edges) {
+                threads.add(pool.submit(new Runnable() {
+                    @Override
+                    public void run() {
+                        Node source = edge.getSource();
+                        Node target = edge.getTarget();
+                        double attribute = (double) edge.getAttribute(NORMALIZED_WEIGHT);
+                        updateAttractiveDisplacement(k, (float) attribute, source, target);
+                    }
+                }));
+            }
+        }
+
+        for (Future<?> thread : threads) {
+            try {
+                thread.get();
+            } catch (Exception e) {
+                throw new RuntimeException("Unable to calculate attractive force", e);
+            }
+        }
+    }
+
+    private void initLayoutDataWithRepulsionDisplacement() {
+        // Repulsive force
+        HashSet<Future<?>> threads = new HashSet<>(nodes.length);
+        if (useCommunityDetection && approximate) {
+            if (communityMap.isEmpty()) {
+                return;
+            }
             for (final Node n : nodes) {
                 threads.add(pool.submit(new Runnable() {
                     @Override
                     public void run() {
-                        ForceVectorNodeLayoutData layoutData = n.getLayoutData();
+                        ForceVectorNodeLayoutData layoutData = new ForceVectorNodeLayoutData();
 
-                        // gravity
-                        float d = (float) Math.sqrt(n.x() * n.x() + n.y() * n.y());
-                        float gf = 0.01f * k * (float) gravity * d;
-                        layoutData.dx -= gf * n.x() / d;
-                        layoutData.dy -= gf * n.y() / d;
+                        Object communityId = n.getAttribute(communityColumnName);
+                        Community nodeCommunity = communityMap.get(communityId);
 
-                        // speed
-                        layoutData.dx *= speed / SPEED_DIVISOR;
-                        layoutData.dy *= speed / SPEED_DIVISOR;
-
-                        // Maintenant on applique le déplacement calculé sur les noeuds.
-                        // nb : le déplacement à chaque passe "instantanné" correspond à la force : c'est une sorte d'accélération.
-                        float xDist = layoutData.dx;
-                        float yDist = layoutData.dy;
-                        float dist = (float) Math.sqrt(layoutData.dx * layoutData.dx + layoutData.dy * layoutData.dy);
-                        if (dist > 0 && !n.isFixed()) {
-                            float limitedDist = Math.min(maxDisplace * ((float) speed / SPEED_DIVISOR), dist);
-                            n.setX(n.x() + xDist / dist * limitedDist);
-                            n.setY(n.y() + yDist / dist * limitedDist);
+                        // Repulsive force by other community
+                        for (Community neighbor : communityMap.values()) {
+                            if (nodeCommunity != neighbor) {
+                                updateRepulsiveDisplacement(k, neighbor.nodes.size(), n.x() - neighbor.x, n.y() - neighbor.y, layoutData);
+                            }
                         }
-                    }
 
+                        // Repulsive force by nodes inside same community
+                        for (Node node : nodeCommunity.nodes) {
+                            if (node != n) {
+                                updateRepulsiveDisplacement(k, 1, n.x() - node.x(), n.y() - node.y(), layoutData);
+                            }
+                        }
+                        n.setLayoutData(layoutData);
+                    }
                 }));
             }
-
-            for (Future<?> thread : threads) {
-                try {
-                    thread.get();
-                } catch (Exception e) {
-                    throw new RuntimeException("Unable to calculate position", e);
-                }
+        } else {
+            // No approximate, calculate every all repulsive force between nodes.
+            for (final Node n : nodes) {
+                threads.add(pool.submit(new Runnable() {
+                    @Override
+                    public void run() {
+                        ForceVectorNodeLayoutData layoutData = new ForceVectorNodeLayoutData();
+                        for (Node otherNode : nodes) {    // On fait toutes les paires de noeuds
+                            if (n != otherNode) {
+                                updateRepulsiveDisplacement(k, 1, n.x() - otherNode.x(), n.y() - otherNode.y(), layoutData);
+                            }
+                        }
+                        n.setLayoutData(layoutData);
+                    }
+                }));
             }
+        }
 
-        } finally {
-            graph.readUnlockAll();
+        for (Future<?> thread : threads) {
+            try {
+                thread.get();
+            } catch (Exception e) {
+                throw new RuntimeException("Unable to calculate repulsive force", e);
+            }
+        }
+    }
+
+    private void communityAttractionDisplacement() {
+        if (communityMap.isEmpty()) {
+            return;
+        }
+        List<Future<?>> threads = new ArrayList<>(nodes.length);
+        for (final Node n : nodes) {
+            threads.add(pool.submit(new Runnable() {
+                @Override
+                public void run() {
+                    // Centroid of community drag nodes together.
+                    Community community = communityMap.get(n.getAttribute(communityColumnName));
+                    ForceVectorNodeLayoutData layoutData = n.getLayoutData();
+                    float xDist = n.x() - community.x;
+                    float yDist = n.y() - community.y;
+                    float dist = (float) Math.sqrt(xDist * xDist + yDist * yDist);
+                    if (dist > community.radius) {
+                        // Only those outside the circle of radius community.radius is dragged by this force.
+                        double distDiff = dist - community.radius;
+                        double weight = weightFunc(distDiff / community.radius, community.nodes.size());
+                        float attractiveForce = (float) (weight * distDiff * distDiff / k);
+                        if (dist > 0) {
+                            float dx = xDist / dist * attractiveForce;
+                            float dy = yDist / dist * attractiveForce;
+                            layoutData.dx -= dx;
+                            layoutData.dy -= dy;
+                        }
+                    }
+                }
+            }));
+        }
+
+        for (Future<?> thread : threads) {
+            try {
+                thread.get();
+            } catch (Exception e) {
+                throw new RuntimeException("Unable to calculate community attraction", e);
+            }
         }
     }
 
@@ -367,7 +424,6 @@ public class FruchtermanReingold extends AbstractLayout implements Layout {
         List<LayoutProperty> properties = new ArrayList<>();
         final String FRUCHTERMAN_REINGOLD = "Fruchterman Reingold";
         final String COMMUNITY = "Community";
-        final String LARGE_GRAPH_OPTIMIZATION = "Large graph optimization";
 
         try {
             properties.add(LayoutProperty.createProperty(
@@ -409,14 +465,14 @@ public class FruchtermanReingold extends AbstractLayout implements Layout {
             properties.add(LayoutProperty.createProperty(
                     this, Boolean.class,
                     "Approximate",
-                    LARGE_GRAPH_OPTIMIZATION,
+                    COMMUNITY,
                     "fruchtermanReingold.approximate.name",
                     "Use the centroid of communities to simplify the calculation.",
                     "getApproximate", "setApproximate"));
             properties.add(LayoutProperty.createProperty(
                     this, Boolean.class,
                     "Community Attraction",
-                    LARGE_GRAPH_OPTIMIZATION,
+                    COMMUNITY,
                     "fruchtermanReingold.communityAttraction.name",
                     "Set nodes can be attracted to the centroid of its community. Makes communities more compact.",
                     "getCommunityAttraction", "setCommunityAttraction"));
@@ -427,149 +483,29 @@ public class FruchtermanReingold extends AbstractLayout implements Layout {
         return properties.toArray(new LayoutProperty[0]);
     }
 
-    private static class Community {
-        int communityId;
-        // centroid x
-        float x;
-        // centroid y
-        float y;
-        // nodes of this community
-        Set<Node> nodes;
-        // edges between nodes of this community
-        Set<Edge> edges;
-        // best radius of this community
-        float radius;
-
-        public Community(int communityId) {
-            this.communityId = communityId;
-            nodes = new HashSet<>();
-            edges = new HashSet<>();
-        }
-
-        @Override
-        public boolean equals(Object o) {
-            if (this == o) return true;
-            if (o == null || getClass() != o.getClass()) return false;
-            Community community = (Community) o;
-            return communityId == community.communityId;
-        }
-
-        @Override
-        public int hashCode() {
-            return Objects.hash(communityId);
-        }
-    }
-
-    private Map<Integer, Community> initCommunity(Node[] nodes) {
-        Map<Integer, Community> map = new HashMap<>();
-
-        for (Node n : nodes) {
-            int communityId;
-            try {
-                communityId = (int) n.getAttribute(MODULARITY_CLASS);
-            } catch (IllegalArgumentException e) {
-                throw new IllegalArgumentException("Please Run Modularity First");
-            }
-            Community cc = map.containsKey(communityId) ? map.get(communityId) : new Community(communityId);
-            cc.nodes.add(n);
-            map.put(communityId, cc);
-        }
-
-        // Prevent unexpected modification
-        return Collections.unmodifiableMap(map);
-    }
-
-    private Map<Node, Map<Community, Integer>> initNodeNeighborCommunity(Edge[] edges, final Map<Integer, Community> communityMap) {
-        final Map<Node, Map<Community, Integer>> map = new ConcurrentHashMap<>();
-
-        for (final Edge edge : edges) {
-            Node source = edge.getSource();
-            Node target = edge.getTarget();
-            Community community = communityMap.get((Integer) source.getAttribute(MODULARITY_CLASS));
-            Community neighbor = communityMap.get((Integer) target.getAttribute(MODULARITY_CLASS));
-            if (community == neighbor) {
-                // Same community. Add edge to community's edges.
-                community.edges.add(edge);
-            } else {
-                // Different community, sum the weight of the edges.
-                Map<Community, Integer> sourceNeighbor = map.containsKey(source) ? map.get(source) : new HashMap<Community, Integer>();
-                int weight = sourceNeighbor.containsKey(neighbor) ? sourceNeighbor.get(neighbor) : 0;
-                sourceNeighbor.put(neighbor, ++weight);
-                map.put(source, sourceNeighbor);
-            }
-        }
-
-        // Prevent unexpected modification
-        return Collections.unmodifiableMap(map);
-    }
-
-    /**
-     * Update Centroid Parallel.
-     *
-     * @param map Community Map
-     */
-    private void updateCentroid(Map<Integer, Community> map) {
-        Set<Future<?>> threads = new HashSet<>(map.size());
-        for (final Community c : map.values()) {
-            Future<?> th = pool.submit(new Runnable() {
-                @Override
-                public void run() {
-                    float x = 0;
-                    float y = 0;
-                    for (Node node : c.nodes) {
-                        x += node.x();
-                        y += node.y();
-                    }
-                    c.x = x / c.nodes.size();
-                    c.y = y / c.nodes.size();
-                    c.radius = (float) Math.sqrt(AREA_MULTIPLICATOR * area / nodes.length * c.nodes.size()) / 2;
-                }
-            });
-            threads.add(th);
-        }
-
-        for (Future<?> thread : threads) {
-            try {
-                thread.get();
-            } catch (Exception e) {
-                throw new RuntimeException("Unable to update Centroid of community", e);
-            }
-        }
-    }
 
     /**
      * Update displacement due to repulsive force.
-     *
-     * @param k          k
-     * @param weight     The weight of node/community of the repulsive force.
-     * @param xDist      x distance
-     * @param yDist      y distance
-     * @param layoutData layoutData, store displacement.
      */
     private void updateRepulsiveDisplacement(float k, int weight, float xDist, float yDist, ForceVectorNodeLayoutData layoutData) {
         float dist = (float) Math.sqrt(xDist * xDist + yDist * yDist);
 
         if (dist > 0) {
-            float repulsiveF = weight * k * k / dist;
-            layoutData.dx += xDist / dist * repulsiveF;
-            layoutData.dy += yDist / dist * repulsiveF;
+            float repulsiveForce = weight * k * k / dist;
+            layoutData.dx += xDist / dist * repulsiveForce;
+            layoutData.dy += yDist / dist * repulsiveForce;
         }
     }
 
     /**
      * Update displacement due to attractive force.
-     *
-     * @param k           k
-     * @param forceWeight the weight of attractive force, smaller between nodes of different community
-     *                    than those of same community.
-     * @param source      edge source node
-     * @param target      edge target node
      */
-    private void updateAttractiveDisplacement(float k, float forceWeight, Node source, Node target) {
+    @SuppressWarnings("SynchronizationOnLocalVariableOrMethodParameter")
+    private void updateAttractiveDisplacement(float k, float weight, Node source, Node target) {
         float xDist = source.x() - target.x();
         float yDist = source.y() - target.y();
         float dist = (float) Math.sqrt(xDist * xDist + yDist * yDist);
-        float attractiveF = forceWeight * dist * dist / k;
+        float attractiveF = weight * dist * dist / k;
         if (dist > 0) {
             ForceVectorNodeLayoutData sourceLayoutData = source.getLayoutData();
             ForceVectorNodeLayoutData targetLayoutData = target.getLayoutData();
@@ -583,6 +519,28 @@ public class FruchtermanReingold extends AbstractLayout implements Layout {
                 targetLayoutData.dy += yDist / dist * attractiveF;
             }
         }
+    }
+
+    private void normalizeEdgeWeight(Edge[] edges) {
+        double max = 0;
+        for (Edge edge : edges) {
+            max = Math.max(max, edge.getWeight());
+        }
+
+        Table edgeTable = graph.getModel().getEdgeTable();
+        Column modCol = edgeTable.getColumn(NORMALIZED_WEIGHT);
+        if (modCol == null) {
+            modCol = edgeTable.addColumn(NORMALIZED_WEIGHT, "Normalized Weight", Double.class, 0.0);
+        }
+
+        for (Edge edge : edges) {
+            edge.setAttribute(modCol, edge.getWeight() / max);
+        }
+    }
+
+    private double weightFunc(double dist, double communitySize) {
+        double a = 1 / (communitySize);
+        return -1 / (a * a * dist + a) + communitySize;
     }
 
     /**
@@ -611,11 +569,6 @@ public class FruchtermanReingold extends AbstractLayout implements Layout {
      */
     public void setApproximate(Boolean approximate) {
         this.approximate = approximate;
-        // Prevent NPE
-        if (approximate && this.edges != null && this.nodes != null) {
-            this.communityMap = initCommunity(nodes);
-            this.nodeNeighborCommunity = initNodeNeighborCommunity(edges, this.communityMap);
-        }
     }
 
     /**
@@ -681,4 +634,5 @@ public class FruchtermanReingold extends AbstractLayout implements Layout {
     public void setSpeed(Double speed) {
         this.speed = speed;
     }
+
 }
