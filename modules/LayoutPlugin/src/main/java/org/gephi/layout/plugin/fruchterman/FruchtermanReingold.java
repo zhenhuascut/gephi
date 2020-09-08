@@ -522,19 +522,28 @@ public class FruchtermanReingold extends AbstractLayout implements Layout {
     }
 
     private void normalizeEdgeWeight(Edge[] edges) {
-        double max = 0;
-        for (Edge edge : edges) {
-            max = Math.max(max, edge.getWeight());
-        }
-
         Table edgeTable = graph.getModel().getEdgeTable();
         Column modCol = edgeTable.getColumn(NORMALIZED_WEIGHT);
         if (modCol == null) {
             modCol = edgeTable.addColumn(NORMALIZED_WEIGHT, "Normalized Weight", Double.class, 0.0);
         }
 
+        double max = 0;
+        double min = 0;
         for (Edge edge : edges) {
-            edge.setAttribute(modCol, edge.getWeight() / max);
+            edge.setAttribute(modCol, Math.log(edge.getWeight() + 1));
+        }
+
+        for (Edge edge : edges) {
+            double w = (double) edge.getAttribute(modCol);
+            max = Math.max(max, w);
+            min = Math.min(min, w);
+        }
+
+        double diff = max - min;
+        for (Edge edge : edges) {
+            double w = (double) edge.getAttribute(modCol);
+            edge.setAttribute(modCol, (w - min) / diff);
         }
     }
 
