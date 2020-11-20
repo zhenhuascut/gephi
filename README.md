@@ -1,6 +1,40 @@
-# Gephi - The Open Graph Viz Platform
+# Gephi With GRA Algorithm
+
+Please cite this article as: Z. Huang, J. Wu, W. Zhu et al., Visualizing complex networks by leveraging community structures, Physica A (2020) 125506, https://doi.org/10.1016/j.physa.2020.125506.
+
+Zhenhua Huang, Junxian Wu, Wentao Zhu, Zhenyu Wang , Sharad Mehrotra , Yangyang Zhao
+
+- In our method, the force weights are adaptively calculated between nodes by taking communities impacts into consideration, facilitating to produce a much better visualization.
+- The method in the paper can be used in various kinds of complex network tasks, such as community visualization, informatics network visualization, and information propagation analysis, etc. We verify our method on networks of different sizes and density.
+- The method can be used to visualize very large networks up to 100000 nodes at a very higher performance compared to strong baselines.
+- We proposed a visualization metric that utilizes multivariate Gaussian distributions to estimate the areas of communities and evaluate the quality of visualization by fitting core areas of communities. The metric works well in evaluating the community structured visualization.
+
+## Build and Run
+
+Make sure you have jdk8 and maven installed.
+
+```
+git clone https://github.com/packagewjx/gephi
+git checkout gra
+mvn clean install -T 4
+cd modules/application
+mvn nbm:cluster-app nbm:run-platform
+```
+
+## Quick Start
+
+See [GRA Quick Start Wiki](https://github.com/packagewjx/gephi/wiki/GRA-Quick-Start).
+
+## Contact us
+
+If you run into any problems, send email to Zhenhua Huang (<mailto:zhhuangscut@gmail.com>) or Junxian Wu (<mailto:wu812730157@gmail.com>).
+
+Or you can just open a new [issue](https://github.com/packagewjx/gephi/issues/new).
+
+# Original Gephi Document
 
 [![Build Status](https://travis-ci.org/gephi/gephi.svg?branch=master)](https://travis-ci.org/gephi/gephi)
+
 [![Downloads](https://img.shields.io/github/downloads/gephi/gephi/v0.9.2/total.svg)](https://github.com/gephi/gephi/releases/tag/v0.9.2)
 [![Downloads](https://img.shields.io/github/downloads/gephi/gephi/v0.9.1/total.svg)](https://github.com/gephi/gephi/releases/tag/v0.9.1)
 
