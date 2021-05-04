@@ -1,3 +1,5 @@
+# Please choose "gra" branch before using GRA algorithm.
+
 Code for GRA algorithm. Visualizing complex networks by leveraging community structures.
 
 GRA is the state-of-the-art visualizing or layout algorithm for complex networks or communties. The alogrithm can be used to visualize almost any types of networks or communities. Feel free to ask any questions if you meet.
