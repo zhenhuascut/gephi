@@ -1,4 +1,4 @@
-# Please choose "gra" branch before using GRA algorithm.
+# Please choose "gra" branch (not master) before using GRA algorithm.
 
 Code for GRA algorithm. Visualizing complex networks by leveraging community structures.
 
